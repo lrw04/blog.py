@@ -1,6 +1,5 @@
 from datetime import datetime
 from pathlib import Path
-import dateutil.parser
 import subprocess
 import argparse
 import shutil
@@ -10,6 +9,17 @@ import sys
 from rjsmin import jsmin
 from rcssmin import cssmin
 from bs4 import BeautifulSoup
+
+
+def excerpt(html, maxl):
+    dom = BeautifulSoup(html, "html.parser")
+    exc = ""
+    for elem in dom.find_all(["p", "li"]):
+        exc += elem.decode_contents()[:maxl] + " "
+        maxl -= len(elem.decode_contents())
+        if maxl < 0:
+            break
+    return exc + "..."
 
 
 class BlogpyRepo:
@@ -75,16 +85,9 @@ class BlogpyRepo:
                 index["subdirs"][subdir], docdir / subdir, blobdir / subdir
             )
         for document in index["documents"]:
-            index["documents"][document]["peek"] = (
-                BeautifulSoup(
-                    (blobdir / (document + ".content.html"))
-                    .open(encoding="utf-8")
-                    .read(),
-                    "html.parser",
-                )
-                .get_text()[:150]
-                .replace("\n", " ")
-                + "..."
+            index["documents"][document]["peek"] = excerpt(
+                (blobdir / (document + ".content.html")).open(encoding="utf-8").read(),
+                self.config["excerpt_length"],
             )
 
     def md2html(self, in_f, out_f):
