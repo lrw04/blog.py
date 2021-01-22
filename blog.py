@@ -1,17 +1,31 @@
-from datetime import datetime
+from datetime import timedelta, datetime
+from rjsmin import jsmin
+from rcssmin import cssmin
+from bs4 import BeautifulSoup
 from pathlib import Path
 import subprocess
-import argparse
 import shutil
 import yaml
 import json
 import sys
-from rjsmin import jsmin
-from rcssmin import cssmin
-from bs4 import BeautifulSoup
+import logging
+import multiprocessing
+import http.server
+import time
+
+ENC = "utf-8"
+logging.basicConfig(format="%(asctime)s [%(levelname)s]: %(message)s", level=logging.WARNING)
 
 
-def excerpt(html, maxl):
+def dict_combine(*args):
+    ans = {}
+    for d in args:
+        for k in d:
+            ans[k] = d[k]
+    return ans
+
+
+def peek_document(html, maxl):
     dom = BeautifulSoup(html, "html.parser")
     exc = ""
     for elem in dom.find_all(["p", "li"]):
@@ -22,129 +36,197 @@ def excerpt(html, maxl):
     return exc + "..."
 
 
-class BlogpyRepo:
-    def __init__(self, root: Path):
-        self.root = root
-        self.document_dir = root / "documents"
-        self.templates_dir = root / "templates"
-        with (root / "config.yaml").open(encoding="utf-8") as f:
-            self.config = yaml.safe_load(f)
-        self.docs = self.parse_dir(self.document_dir)
+class Document:
+    def __init__(self, p: Path, fmt: str, deltat: timedelta):
+        logging.info(f"Parsing document {p}")
+        self.path = p
+        self.peek = None
+        assert p.suffix == ".md"
+        with open(p, encoding=ENC) as f:
+            meta = next(yaml.safe_load_all(f))
+        self.meta = dict_combine({"visible": True}, meta)
+        self.meta["modification"] = (
+            datetime.strptime(self.meta["modification"], fmt) + deltat
+        ).timestamp()
+        self.shown = (
+            "hidden_until" not in self.meta
+            or datetime.strptime(self.meta["hidden_until"], fmt) + deltat
+            < datetime.now()
+        )
 
-    def parse_dir(self, path: Path) -> dict:
-        sub = {
-            "subdirs": {},
-            "documents": {},
-        }
-        for sc in path.iterdir():
+    def generate_peek(self, p: Path, l: int):
+        self.peek = peek_document(p.open(encoding=ENC).read(), l)
+
+    def index(self) -> dict:
+        return dict_combine({"peek": self.peek}, self.meta)
+
+
+class Category:
+    def __init__(self, p: Path, fmt: str, deltat: timedelta):
+        logging.info(f"Parsing category {p}")
+        self.subcategories = {}
+        self.documents = {}
+        self.path = p
+        with (p / "config.yaml").open(encoding=ENC) as f:
+            self.config = dict_combine(
+                {"listed": True, "brief": False}, yaml.safe_load(f)
+            )
+        for sc in p.iterdir():
             if sc.parts[-1][0] == ".":
                 continue
             if sc.is_dir():
-                sub["subdirs"][sc.stem] = self.parse_dir(sc)
+                try:
+                    self.subcategories[sc.stem] = Category(sc, fmt, deltat)
+                except Exception:
+                    logging.warning(f"Ignoring subcategory {sc} with invalid config")
             elif sc.suffix == ".md":
-                sub["documents"][sc.stem] = self.parse_doc(sc)
-        with (path / "config.yaml").open(encoding="utf-8") as f:
-            return {"listed": True, "brief": False} | yaml.safe_load(f) | sub
+                try:
+                    self.documents[sc.stem] = Document(sc, fmt, deltat)
+                    if not self.documents[sc.stem].shown:
+                        self.documents.pop(sc.stem)
+                except Exception:
+                    logging.warning(f"Ignoring document {sc} with invalid format")
 
-    def parse_doc(self, path: Path) -> dict:
-        with path.open(encoding="utf-8") as f:
-            meta = next(yaml.safe_load_all(f))
-            return (
-                {"visible": True}
-                | meta
-                | {
-                    "modification": datetime.strptime(
-                        meta["modification"], self.config["datetime_format"]
-                    ).timestamp(),
-                }
-            )
+    def build_hierarchy(self, p: Path, tem: Path):
+        logging.info(f"Building hierarchy for {p}")
+        shutil.copy(tem / "index.html", p / "index.html")
+        for sc in self.subcategories:
+            (p / sc).mkdir()
+            self.subcategories[sc].build_hierarchy(p / sc, tem)
+        for d in self.documents:
+            shutil.copy(tem / "document.html", p / (d + ".html"))
 
-    def generate(self):
-        self.artifacts_dir = self.root / self.config["artifacts_dir"]
-        shutil.rmtree(self.artifacts_dir, ignore_errors=True)
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        self.blob_dir = self.artifacts_dir / "blob"
-        self.blob_dir.mkdir(exist_ok=True)
-        shutil.copytree(
-            self.root / "static", self.artifacts_dir / "static", dirs_exist_ok=True
+    def build_blob_hierarchy(self, p: Path):
+        for sc in self.subcategories:
+            (p / sc).mkdir()
+            self.subcategories[sc].build_blob_hierarchy(p / sc)
+        if self.config["brief"]:
+            shutil.copy(self.path / "brief.html", p / "brief.html")
+
+    def get_jobs(self, blob: Path) -> list[tuple[Path, Path]]:
+        ans = []
+        for sc in self.subcategories:
+            ans += self.subcategories[sc].get_jobs(blob / sc)
+        for d in self.documents:
+            ans.append((self.documents[d].path, blob / (d + ".html")))
+        return ans
+
+    def generate_peek(self, b: Path, l: int):
+        for sc in self.subcategories:
+            self.subcategories[sc].generate_peek(b / sc, l)
+        for d in self.documents:
+            self.documents[d].generate_peek(b / (d + ".html"), l)
+
+    def index(self) -> dict:
+        ans = self.config.copy()
+        ans["subcategories"] = {}
+        ans["documents"] = {}
+        for sc in self.subcategories:
+            ans["subcategories"][sc] = self.subcategories[sc].index()
+        for d in self.documents:
+            ans["documents"][d] = self.documents[d].index()
+        return ans
+
+
+class Repository:
+    def __init__(self, root: Path):
+        self.root = root
+        self.parse()
+
+    def parse(self):
+        logging.info("Started parsing")
+        try:
+            with (self.root / "config.yaml").open(encoding=ENC) as f:
+                self.config = yaml.safe_load(f)
+        except Exception:
+            logging.critical(f"Config parsing failed")
+            exit(-1)
+        self.ts_delta = (
+            datetime.utcnow()
+            - datetime.now()
+            + timedelta(seconds=self.config["timezone"] * 3600)
         )
-        self.generate_blob(Path("."), self.docs)
-        self.generate_hierarchy(Path("."), self.docs)
-        for x in (self.artifacts_dir / "static").iterdir():
-            if x.suffix == ".js":
-                self.minify_js(x)
-            elif x.suffix == ".css":
-                self.minify_css(x)
-        self.peek_content(self.docs, self.document_dir, self.blob_dir)
-        with (self.blob_dir / "index.json").open("w", encoding="utf-8") as f:
-            f.write(json.dumps(self.docs))
-
-    def peek_content(self, index, docdir, blobdir):
-        for subdir in index["subdirs"]:
-            self.peek_content(
-                index["subdirs"][subdir], docdir / subdir, blobdir / subdir
+        try:
+            self.tree = Category(
+                self.root / "documents", self.config["datetime_format"], self.ts_delta
             )
-        for document in index["documents"]:
-            index["documents"][document]["peek"] = excerpt(
-                (blobdir / (document + ".content.html")).open(encoding="utf-8").read(),
-                self.config["excerpt_length"],
-            )
+        except:
+            logging.critical(f"Config parsing failed")
+            exit(-1)
 
-    def md2html(self, in_f, out_f):
+    def build(self):
+        logging.info("Started build")
+        artifact_root = self.root / self.config["artifacts_dir"]
+        shutil.rmtree(artifact_root, ignore_errors=True)
+        artifact_root.mkdir()
+
+        blob_root = artifact_root / "blob"
+        blob_root.mkdir()
+        shutil.copytree(self.root / "static", artifact_root / "static")
+
+        self.tree.build_hierarchy(artifact_root, self.root / "templates")
+        self.tree.build_blob_hierarchy(blob_root)
+        jobs = self.tree.get_jobs(blob_root)
+        self.convert_all(jobs, self.config["pandoc_args"])
+
+        self.tree.generate_peek(blob_root, self.config["peek_length"])
+        with (blob_root / "index.json").open("w", encoding=ENC) as f:
+            json.dump(self.tree.index(), f)
+            f.write("\n")
+        for f in (artifact_root / "static").iterdir():
+            if f.suffix == ".js":
+                with f.open(encoding=ENC) as fin:
+                    cont = fin.read()
+                with f.open("w", encoding=ENC) as fout:
+                    fout.write(jsmin(cont))
+                    fout.write("\n")
+            elif f.suffix == ".css":
+                with f.open(encoding=ENC) as fin:
+                    cont = fin.read()
+                with f.open("w", encoding=ENC) as fout:
+                    fout.write(cssmin(cont))
+                    fout.write("\n")
+
+    def convert_all(self, jobs: list[tuple[Path, Path]], args: list[str]):
+        cmds = [["pandoc", str(q[0]), "-o", str(q[1])] + args for q in jobs]
+        with multiprocessing.Pool() as p:
+            p.map(subprocess.run, cmds)
+
+    def serve(self):
         subprocess.run(
-            ["pandoc", str(in_f), "-o", str(out_f)] + self.config["pandoc_args"]
+            [
+                "python",
+                "-m",
+                "http.server",
+                "-d",
+                str(self.root / self.config["artifacts_dir"]),
+            ]
         )
-
-    def generate_blob(self, path, material):
-        print("blob:", path)
-        (self.blob_dir / path).mkdir(exist_ok=True)
-        if material["brief"]:
-            shutil.copy(
-                self.document_dir / path / "brief.html",
-                self.blob_dir / path / "brief.html",
-            )
-        for post in material["documents"]:
-            self.md2html(
-                self.document_dir / path / (post + ".md"),
-                self.blob_dir / path / (post + ".content.html"),
-            )
-        for subdir in material["subdirs"]:
-            self.generate_blob(path / subdir, material["subdirs"][subdir])
-
-    def generate_hierarchy(self, path, material):
-        print("hierarchy:", path)
-        (self.artifacts_dir / path).mkdir(exist_ok=True)
-        shutil.copy(
-            self.templates_dir / "index.html", self.artifacts_dir / path / "index.html"
-        )
-        for post in material["documents"]:
-            shutil.copy(
-                self.templates_dir / "document.html",
-                self.artifacts_dir / path / (post + ".html"),
-            )
-        for subdir in material["subdirs"]:
-            self.generate_hierarchy(path / subdir, material["subdirs"][subdir])
-
-    def minify_js(self, fn):
-        with fn.open(encoding="utf-8") as f:
-            cont = f.read()
-        with fn.open("w", encoding="utf-8") as f:
-            f.write(jsmin(cont))
-
-    def minify_css(self, fn):
-        with fn.open(encoding="utf-8") as f:
-            cont = f.read()
-        with fn.open("w", encoding="utf-8") as f:
-            f.write(cssmin(cont))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compile a blog.py repository.")
-    parser.add_argument(
-        "--root", nargs="?", type=Path, const=Path("."), default=Path(".")
-    )
-    args = parser.parse_args()
-    BlogpyRepo(args.root).generate()
+    t0 = time.thread_time()
+    try:
+        op = sys.argv[1]
+        assert len(sys.argv) <= 3
+    except IndexError:
+        print("Error: operation not specified: can be `build' or `serve'.")
+        exit(-1)
+    except AssertionError:
+        print("Error: too many arguments specified.")
+        exit(-1)
+    if op not in ["build", "serve"]:
+        print("Error: invalid operation, should be `build' or `serve'.")
+        exit(-1)
+    p = "." if len(sys.argv) < 3 else sys.argv[2]
+    repo = Repository(Path(p))
+    t1 = time.thread_time()
+    if op == "build":
+        repo.build()
+        t2 = time.thread_time()
+        logging.info(f'Parsing lasted {t1 - t0} s, building lasted {t2 - t1} s')
+    elif op == "serve":
+        repo.serve()
 
 
 if __name__ == "__main__":
