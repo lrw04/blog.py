@@ -3,6 +3,7 @@ from rjsmin import jsmin
 from rcssmin import cssmin
 from bs4 import BeautifulSoup
 from pathlib import Path
+from email.utils import format_datetime
 import subprocess
 import shutil
 import yaml
@@ -12,9 +13,14 @@ import logging
 import multiprocessing
 import http.server
 import time
+import operator
+from xml.sax.saxutils import escape as xml_escape
 
 ENC = "utf-8"
-logging.basicConfig(format="%(asctime)s [%(levelname)s]: %(message)s", level=logging.WARNING)
+GEN = "blog.py by lrw04"
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s]: %(message)s", level=logging.WARNING
+)
 
 
 def dict_combine(*args):
@@ -45,9 +51,8 @@ class Document:
         with open(p, encoding=ENC) as f:
             meta = next(yaml.safe_load_all(f))
         self.meta = dict_combine({"visible": True}, meta)
-        self.meta["modification"] = (
-            datetime.strptime(self.meta["modification"], fmt) + deltat
-        ).timestamp()
+        self.ts = datetime.strptime(self.meta["modification"], fmt)
+        self.meta["modification"] = (self.ts + deltat).timestamp()
         self.shown = (
             "hidden_until" not in self.meta
             or datetime.strptime(self.meta["hidden_until"], fmt) + deltat
@@ -59,6 +64,20 @@ class Document:
 
     def index(self) -> dict:
         return dict_combine({"peek": self.peek}, self.meta)
+
+    def entry(self, d: str, p: list) -> list:
+        if not self.shown:
+            return []
+        return [
+            {
+                "title": self.meta["title"],
+                "link": "https://" + d + "/" + "/".join(p) + ".html",
+                "desc": self.peek,
+                "tstr": format_datetime(self.ts),
+                "ts": self.ts,
+                "id": "/".join(p),
+            }
+        ]
 
 
 class Category:
@@ -127,6 +146,31 @@ class Category:
             ans["documents"][d] = self.documents[d].index()
         return ans
 
+    def entry(self, d: str, p: list) -> list:
+        ans = []
+        for sc in self.subcategories:
+            ans += self.subcategories[sc].entry(d, p + [sc])
+        for e in self.documents:
+            ans += self.documents[e].entry(d, p + [e])
+        return ans
+
+
+def rss_item(entry):
+    return """        <item>
+            <title>{title}</title>
+            <link>{link}</link>
+            <description>{desc}</description>
+            <pubDate>{tstr}</pubDate>
+            <guid>{guid}</guid>
+        </item>
+""".format(
+        title=entry["title"],
+        link=entry["link"],
+        desc=xml_escape(entry["desc"]),
+        tstr=entry["tstr"],
+        guid=entry["link"],
+    )
+
 
 class Repository:
     def __init__(self, root: Path):
@@ -171,7 +215,7 @@ class Repository:
 
         self.tree.generate_peek(blob_root, self.config["peek_length"])
         with (blob_root / "index.json").open("w", encoding=ENC) as f:
-            json.dump(self.tree.index(), f)
+            json.dump(self.tree.index(), f, sort_keys=True)
             f.write("\n")
         for f in (artifact_root / "static").iterdir():
             if f.suffix == ".js":
@@ -186,6 +230,8 @@ class Repository:
                 with f.open("w", encoding=ENC) as fout:
                     fout.write(cssmin(cont))
                     fout.write("\n")
+        with (artifact_root / "rss.xml").open("w", encoding=ENC) as f:
+            f.write(self.rss())
 
     def convert_all(self, jobs: list[tuple[Path, Path]], args: list[str]):
         cmds = [["pandoc", str(q[0]), "-o", str(q[1])] + args for q in jobs]
@@ -201,6 +247,32 @@ class Repository:
                 "-d",
                 str(self.root / self.config["artifacts_dir"]),
             ]
+        )
+
+    def rss(self):
+        entries = sorted(
+            self.tree.entry(self.config["rss"]["domain"], []),
+            key=operator.itemgetter("ts"),
+        )
+        return """<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+    <channel>
+        <title>{title}</title>
+        <link>{link}</link>
+        <description>{desc}</description>
+        <language>{lang}</language>
+        <generator>{gen}</generator>
+        <atom:link href="{href}" rel="self" type="application/rss+xml" />
+{items}
+    </channel>
+</rss>
+""".format(
+            title=self.tree.config["title"],
+            link="https://" + self.config["rss"]["domain"] + "/",
+            desc=self.config["rss"]["desc"],
+            lang=self.config["rss"]["lang"],
+            gen=GEN,
+            items="".join([rss_item(k) for k in entries]),
+            href="https://" + self.config["rss"]["domain"] + "/rss.xml",
         )
 
 
@@ -224,7 +296,7 @@ def main():
     if op == "build":
         repo.build()
         t2 = time.thread_time()
-        logging.info(f'Parsing lasted {t1 - t0} s, building lasted {t2 - t1} s')
+        logging.info(f"Parsing lasted {t1 - t0} s, building lasted {t2 - t1} s")
     elif op == "serve":
         repo.serve()
 
