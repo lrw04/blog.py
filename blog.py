@@ -186,9 +186,9 @@ class Repository:
             logging.critical(f"Config parsing failed")
             exit(-1)
         self.ts_delta = (
-            datetime.utcnow()
-            - datetime.now()
-            + timedelta(seconds=self.config["timezone"] * 3600)
+            datetime.now()
+            - datetime.utcnow()
+            - timedelta(seconds=self.config["timezone"] * 3600)
         )
         try:
             self.tree = Category(
