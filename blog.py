@@ -11,7 +11,6 @@ import json
 import sys
 import logging
 import multiprocessing
-import http.server
 import time
 import operator
 from xml.sax.saxutils import escape as xml_escape
@@ -50,7 +49,7 @@ class Document:
         assert p.suffix == ".md"
         with open(p, encoding=ENC) as f:
             meta = next(yaml.safe_load_all(f))
-        self.meta = dict_combine({"visible": True}, meta)
+        self.meta = dict_combine({"visible": True, "spoilers": False}, meta)
         self.ts = datetime.strptime(self.meta["modification"], fmt)
         self.meta["modification"] = (self.ts + deltat).timestamp()
         self.shown = (
@@ -60,7 +59,8 @@ class Document:
         )
 
     def generate_peek(self, p: Path, l: int):
-        self.peek = peek_document(p.open(encoding=ENC).read(), l)
+        self.content = p.open(encoding=ENC).read()
+        self.peek = peek_document(self.content, l)
 
     def index(self) -> dict:
         return dict_combine({"peek": self.peek}, self.meta)
@@ -72,10 +72,11 @@ class Document:
             {
                 "title": self.meta["title"],
                 "link": "https://" + d + "/" + "/".join(p) + ".html",
-                "desc": self.peek,
+                "desc": self.content,
                 "tstr": format_datetime(self.ts),
                 "ts": self.ts,
                 "id": "/".join(p),
+                "visible": self.meta["visible"],
             }
         ]
 
@@ -96,15 +97,21 @@ class Category:
             if sc.is_dir():
                 try:
                     self.subcategories[sc.stem] = Category(sc, fmt, deltat)
-                except Exception:
-                    logging.warning(f"Ignoring subcategory {sc} with invalid config")
+                except Exception as e:
+                    logging.warning(
+                        f"Ignoring subcategory {sc} with invalid config: " + str(e)
+                    )
             elif sc.suffix == ".md":
                 try:
                     self.documents[sc.stem] = Document(sc, fmt, deltat)
+                    if not self.config["listed"]:
+                        self.documents[sc.stem].meta["visible"] = False
                     if not self.documents[sc.stem].shown:
                         self.documents.pop(sc.stem)
-                except Exception:
-                    logging.warning(f"Ignoring document {sc} with invalid format")
+                except Exception as e:
+                    logging.warning(
+                        f"Ignoring document {sc} with invalid format: " + str(e)
+                    )
 
     def build_hierarchy(self, p: Path, tem: Path):
         logging.info(f"Building hierarchy for {p}")
@@ -250,10 +257,11 @@ class Repository:
         )
 
     def rss(self):
-        entries = sorted(
+        all_entries = sorted(
             self.tree.entry(self.config["rss"]["domain"], []),
             key=operator.itemgetter("ts"),
         )
+        entries = [e for e in all_entries if e["visible"]]
         return """<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
     <channel>
         <title>{title}</title>
